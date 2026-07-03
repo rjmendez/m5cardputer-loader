@@ -38,6 +38,7 @@
 #include "esp_partition.h"
 #include "fwutil.h"      // pure helpers: lipoPct, prettyName, extractVersion, safeName, fwIdFromPath
 #include "mbedtls/sha256.h"  // firmware integrity: SHA-256 of downloaded/launched images
+#include "esp_random.h"      // esp_random() — WebUI per-session access token
 
 // ---- M5Cardputer microSD pins (from the hardware spec) --------------
 static const int SD_SCK  = 40;   // G40 CLK
@@ -1110,31 +1111,72 @@ static void settingsMenu() {
     }
 }
 
+// Escape a string for safe inclusion in HTML text OR a single/double-quoted
+// attribute (filenames are attacker-influenced via upload, so never inline raw).
+static String htmlEscape(const String& s) {
+    String o; o.reserve(s.length() + 8);
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '&':  o += "&amp;";  break;
+            case '<':  o += "&lt;";   break;
+            case '>':  o += "&gt;";   break;
+            case '"':  o += "&quot;"; break;
+            case '\'': o += "&#39;";  break;
+            default:   o += c;        break;
+        }
+    }
+    return o;
+}
+
 // =====================================================================
 //  WebUI — host a tiny web page over WiFi to upload/delete SD firmwares
 //  from a browser on your PC/phone. No card removal needed.
+//
+//  Access control: a per-session token (shown on the device screen) must be
+//  present as ?t=<token> on every request. This authenticates (only someone
+//  who can read the screen may touch SD) AND stops CSRF — a forged cross-site
+//  request can't supply the token, unlike a cookie/Basic credential the browser
+//  would auto-send. Filenames are HTML-escaped; /delete is POST + basename-only.
 // =====================================================================
 static void webUI() {
     if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
     if (!connectWiFi()) return;
 
-    WebServer server(80);
-    static File uploadFile;          // static: outlives the upload-callback invocations
+    // Per-session access token (see header comment). 32 bits of entropy as 8 hex chars.
+    char tkbuf[9]; snprintf(tkbuf, sizeof(tkbuf), "%08x", (unsigned)esp_random());
+    String token = tkbuf;
 
-    auto pageHTML = []() -> String {
+    WebServer server(80);
+    // These outlive the individual upload-callback invocations. Function-local
+    // statics are referenced directly by the handler lambdas (no capture needed).
+    static File     uploadFile;
+    static String   uploadPath;      // path of the file currently being written
+    static bool     uploadReject;    // this upload was refused (auth/name/size/open)
+    static bool     uploadDone;      // an upload completed OK (screen toast)
+    static bool     uploadFail;      // an upload failed/was rejected (screen toast)
+    static uint32_t uploadGot;       // bytes written so far (size cap)
+    uploadReject = uploadDone = uploadFail = false; uploadGot = 0; uploadPath = "";
+    const uint32_t MAX_UPLOAD = 8u * 1024 * 1024;   // 8MB ceiling (a full flash image)
+
+    auto pageHTML = [&token]() -> String {
         String h = "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
                    "<title>M5Cardputer Loader</title></head><body style='font-family:sans-serif;margin:1em'>"
                    "<h2>M5Cardputer Loader</h2>"
-                   "<form method='POST' action='/upload' enctype='multipart/form-data'>"
+                   "<form method='POST' action='/upload?t=" + token + "' enctype='multipart/form-data'>"
                    "<input type=file name=f accept='.bin'> <input type=submit value=Upload></form><hr><h3>/firmware</h3><ul>";
         File dir = SD.open(FW_DIR);
         for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
             if (!f.isDirectory()) {
                 String n = f.name(); int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
                 String low = n; low.toLowerCase();
-                if (low.endsWith(".bin"))
-                    h += "<li>" + n + " (" + String((uint32_t)(f.size() / 1024)) + "K) "
-                         "<a href='/delete?f=" + n + "'>[delete]</a></li>";
+                if (low.endsWith(".bin")) {
+                    String e = htmlEscape(n);   // never inline a raw filename
+                    h += "<li>" + e + " (" + String((uint32_t)(f.size() / 1024)) + "K) "
+                         "<form style='display:inline' method='POST' action='/delete?t=" + token + "'>"
+                         "<input type=hidden name=f value='" + e + "'>"
+                         "<input type=submit value='delete'></form></li>";
+                }
             }
             f.close();
         }
@@ -1144,38 +1186,70 @@ static void webUI() {
     };
 
     String ip = WiFi.localIP().toString();
-    auto drawInfo = [&ip]() {
-        std::vector<String> info = { "WebUI running", "http://" + ip, "Open in browser to", "upload .bin files", "` = stop" };
+    auto drawInfo = [&ip, &token]() {
+        std::vector<String> info = { "WebUI running", "http://" + ip + "/?t=" + token,
+                                     "open that URL", "(token required)", "` = stop" };
         cv.fillScreen(COL_BG); drawHeader("WebUI Upload");
         cv.setTextSize(FONT_BIG); cv.setTextColor(COL_TXT, COL_BG); cv.setTextDatum(top_left);
         int y = LIST_Y + 2; for (auto& l : info) { cv.drawString(l, 6, y); y += ROW_H; }
         cv.pushSprite(0, 0);
     };
-    static bool uploadDone = false;
 
-    server.on("/", HTTP_GET, [&server, pageHTML]() { server.send(200, "text/html", pageHTML()); });
-    server.on("/delete", HTTP_GET, [&server]() {
-        if (server.hasArg("f")) SD.remove(String(FW_DIR) + "/" + server.arg("f"));
-        server.sendHeader("Location", "/"); server.send(303, "text/plain", "");
+    // Authorized iff the request carries the correct ?t= token.
+    auto ok = [&server, &token]() -> bool { return server.arg("t") == token; };
+
+    server.on("/", HTTP_GET, [&server, &ok, pageHTML]() {
+        if (!ok()) { server.send(403, "text/plain", "forbidden\n"); return; }
+        server.send(200, "text/html", pageHTML());
+    });
+    server.on("/delete", HTTP_POST, [&server, &ok, &token]() {
+        if (!ok()) { server.send(403, "text/plain", "forbidden\n"); return; }
+        String f = server.arg("f");
+        // only a plain basename inside /firmware: no separators, no dot-dir, not hidden
+        if (f.length() && f.indexOf('/') < 0 && f.indexOf('\\') < 0 &&
+            f.indexOf("..") < 0 && !f.startsWith("."))
+            SD.remove(String(FW_DIR) + "/" + f);
+        server.sendHeader("Location", "/?t=" + token); server.send(303, "text/plain", "");
     });
     server.on("/upload", HTTP_POST,
-        [&server]() { server.sendHeader("Location", "/"); server.send(303, "text/plain", ""); },
-        [&server]() {
+        [&server, &token]() {
+            server.sendHeader("Location", "/?t=" + token);
+            server.send(303, "text/plain", uploadFail ? "upload failed\n" : "");
+        },
+        [&server, &ok, MAX_UPLOAD]() {
             HTTPUpload& up = server.upload();
             if (up.status == UPLOAD_FILE_START) {
-                String fn = up.filename; int sl = fn.lastIndexOf('/'); if (sl >= 0) fn = fn.substring(sl + 1);
+                uploadReject = false; uploadGot = 0; uploadPath = "";
+                if (!ok()) { uploadReject = uploadFail = true; return; }   // reject unauth/CSRF before touching SD
+                String fn = up.filename;
+                int sl = fn.lastIndexOf('/');  if (sl >= 0) fn = fn.substring(sl + 1);
+                sl = fn.lastIndexOf('\\');     if (sl >= 0) fn = fn.substring(sl + 1);
+                fn.replace("..", "");
                 String low = fn; low.toLowerCase(); if (!low.endsWith(".bin")) fn += ".bin";
-                String p = String(FW_DIR) + "/" + fn;
-                SD.remove(p); uploadFile = SD.open(p, FILE_WRITE);
+                if (fn.startsWith(".") || fn == ".bin") { uploadReject = uploadFail = true; return; }
+                uploadPath = String(FW_DIR) + "/" + fn;
+                SD.remove(uploadPath); uploadFile = SD.open(uploadPath, FILE_WRITE);
+                if (!uploadFile) { uploadReject = uploadFail = true; uploadPath = ""; return; }
                 drawProgressBar("Uploading", 0, 0);
             } else if (up.status == UPLOAD_FILE_WRITE) {
+                if (uploadReject) return;
+                uploadGot += up.currentSize;
+                if (uploadGot > MAX_UPLOAD) {                       // size cap -> abort + clean up
+                    uploadReject = uploadFail = true;
+                    if (uploadFile) uploadFile.close();
+                    if (uploadPath.length()) SD.remove(uploadPath);
+                    return;
+                }
                 if (uploadFile) uploadFile.write(up.buf, up.currentSize);
-                // Content-Length ~= file size (+ small multipart overhead) -> usable progress bar
-                int total = server.header("Content-Length").toInt();
-                drawProgressBar("Uploading", up.totalSize, total > 0 ? total : 0);
+                int total = server.header("Content-Length").toInt();  // ~file size -> progress bar
+                drawProgressBar("Uploading", uploadGot, total > 0 ? total : 0);
             } else if (up.status == UPLOAD_FILE_END) {
                 if (uploadFile) uploadFile.close();
-                uploadDone = true;
+                if (!uploadReject) uploadDone = true;
+            } else if (up.status == UPLOAD_FILE_ABORTED) {          // client vanished mid-upload
+                if (uploadFile) uploadFile.close();
+                if (uploadPath.length()) SD.remove(uploadPath);     // drop the partial file (no fd leak)
+                uploadFail = true;
             }
         });
     const char* hdrKeys[] = { "Content-Length" };           // read it in the upload handler for progress
@@ -1186,6 +1260,7 @@ static void webUI() {
     for (;;) {
         server.handleClient();
         if (uploadDone) { uploadDone = false; screenMsg("Uploaded!", nullptr, COL_OK, 1000); drawInfo(); }
+        if (uploadFail) { uploadFail = false; screenMsg("Upload rejected", nullptr, COL_ERR, 1200); drawInfo(); }
         M5Cardputer.update();
         if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
             auto st = M5Cardputer.Keyboard.keysState();
