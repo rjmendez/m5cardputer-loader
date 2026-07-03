@@ -141,6 +141,20 @@ static uint8_t  g_bright = 128;
 // =====================================================================
 enum Nav { N_NONE, N_UP, N_DOWN, N_ENTER, N_BACK };
 
+// Abort a stalled network transfer after this many ms with no bytes received.
+static const uint32_t STREAM_IDLE_MS = 12000;
+
+// True if the user pressed back/cancel (` or Backspace). Used to abort long
+// network transfers. Caller must have run M5Cardputer.update() first.
+static bool cancelPressed() {
+    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        auto st = M5Cardputer.Keyboard.keysState();
+        if (st.del) return true;
+        for (char c : st.word) if (c == '`') return true;
+    }
+    return false;
+}
+
 static Nav pollNav() {
     M5Cardputer.update();
     updatePower();                          // throttled battery/charge sampling
@@ -712,9 +726,16 @@ static bool fetchCatalog() {
         curKey = 0;
     };
 
+    uint32_t lastRx = millis(); bool stalled = false, cancelled = false;
     while (http.connected() || s->available()) {
         int n = s->available() ? s->readBytes(rb, sizeof(rb)) : 0;
-        if (n <= 0) { if (!http.connected()) break; delay(2); continue; }
+        if (n <= 0) {
+            if (!http.connected()) break;
+            if (millis() - lastRx > STREAM_IDLE_MS) { stalled = true; break; }
+            M5Cardputer.update(); if (cancelPressed()) { cancelled = true; break; }
+            delay(2); continue;
+        }
+        lastRx = millis();
         for (int i = 0; i < n; i++) {
             char c = (char)rb[i];
             if (instr) {                          // inside a string literal
@@ -765,9 +786,11 @@ static bool fetchCatalog() {
             cv.pushSprite(0, 0);
         }
         M5Cardputer.update();
+        if (cancelPressed()) { cancelled = true; break; }
     }
     out.close();
     http.end();
+    if (stalled || cancelled) { SD.remove(CAT_TSV); screenMsg(cancelled ? "Cancelled" : "Catalog stalled", nullptr, COL_ERR, 1500); return false; }
     screenMsg("Catalog updated", (String(found) + " firmwares").c_str(), COL_OK, 1500);
     return found > 0;
 }
@@ -790,15 +813,27 @@ static bool downloadURLToFile(const String& url, const String& dst, const char* 
     File of = SD.open(dst, FILE_WRITE);
     if (!of) { http.end(); screenMsg("SD open failed", nullptr, COL_ERR, 2500); return false; }
 
-    uint8_t buf[2048]; uint32_t got = 0; uint32_t lastUI = 0;
+    uint8_t buf[2048]; uint32_t got = 0; uint32_t lastUI = 0; uint32_t lastRx = millis();
+    bool wrErr = false, stalled = false, cancelled = false;
     while (http.connected() || s->available()) {
         int n = s->available() ? s->readBytes(buf, sizeof(buf)) : 0;
-        if (n <= 0) { if (!http.connected()) break; delay(2); continue; }
-        of.write(buf, n); got += n;
+        if (n <= 0) {
+            if (!http.connected()) break;
+            if (millis() - lastRx > STREAM_IDLE_MS) { stalled = true; break; }   // data-silence watchdog
+            M5Cardputer.update(); if (cancelPressed()) { cancelled = true; break; }
+            delay(2); continue;
+        }
+        lastRx = millis();
+        size_t w = of.write(buf, n);
+        if (w != (size_t)n) { wrErr = true; break; }                            // SD full / write error
+        got += w;
         if (millis() - lastUI > 200) { lastUI = millis(); drawProgressBar("Downloading", got, total > 0 ? total : 0); }
-        M5Cardputer.update();
+        M5Cardputer.update(); if (cancelPressed()) { cancelled = true; break; }
     }
     of.close(); http.end();
+    if (wrErr)     { SD.remove(dst); screenMsg("SD write failed", nullptr, COL_ERR, 3000); return false; }
+    if (cancelled) { SD.remove(dst); screenMsg("Cancelled", nullptr, COL_ERR, 1500); return false; }
+    if (stalled)   { SD.remove(dst); screenMsg("Download stalled", nullptr, COL_ERR, 3000); return false; }
     if (total > 0 && (int)got < total) { SD.remove(dst); screenMsg("Download incomplete", nullptr, COL_ERR, 3000); return false; }
     return got > 0;
 }
@@ -848,9 +883,16 @@ static void githubInstall() {
     std::vector<String> urls, labels;
     String token; bool instr = false, esc = false; bool capUrl = false;
     const char* KEY = "browser_download_url";
+    uint32_t lastRx = millis(); bool stalled = false, cancelled = false;
     while ((http.connected() || s->available()) && urls.size() < 40) {
         int c = s->read();
-        if (c < 0) { if (!http.connected()) break; delay(2); continue; }
+        if (c < 0) {
+            if (!http.connected()) break;
+            if (millis() - lastRx > STREAM_IDLE_MS) { stalled = true; break; }
+            M5Cardputer.update(); if (cancelPressed()) { cancelled = true; break; }
+            delay(2); continue;
+        }
+        lastRx = millis();
         char ch = (char)c;
         if (instr) {
             if (esc) { if (token.length() < 256) token += ch; esc = false; }  // bound growth on the escape path too
@@ -863,6 +905,7 @@ static void githubInstall() {
         } else if (ch == '"') { token = ""; instr = true; }
     }
     http.end();
+    if (stalled || cancelled) { screenMsg(cancelled ? "Cancelled" : "GitHub stalled", nullptr, COL_ERR, 1500); return; }
 
     if (urls.empty()) { screenMsg("No .bin assets", "in latest release", COL_ERR, 3000); return; }
     int sel = listMenu("GitHub assets", labels, "ENTER=install  `=back");
