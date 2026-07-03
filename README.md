@@ -111,6 +111,13 @@ itself, **RESET always returns to the loader regardless of what the app did.**
 > never compiles one, so the hook can't go through the normal build. It's built
 > standalone (see below) and flashed at `0x0`.
 
+> **Not a security boundary.** `bootflag`, `otadata` and `factory` live in plain
+> writable flash (no Secure Boot / flash encryption), and the hook doesn't check
+> *who* set the flag. A launched firmware runs fully privileged and can forge the
+> boot flag to keep booting itself, or erase `factory` to disable the loader — so
+> the guarantee above holds for **well-behaved** apps; it's a convenience
+> mechanism, not containment against a hostile image.
+
 ---
 
 ## Building & flashing

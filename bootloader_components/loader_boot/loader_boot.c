@@ -18,6 +18,12 @@
 //    - Net effect: pressing RESET always returns to the loader; the loader
 //      explicitly arms a single boot of the selected firmware each time.
 //
+//  NOT a security boundary: bootflag/otadata/factory are plain writable flash
+//  (no Secure Boot / flash encryption) and this hook does not check WHO set the
+//  flag. A launched firmware runs fully privileged in ota_0 and can forge
+//  BOOT_MAGIC to keep booting itself, or erase factory to disable the loader.
+//  The "works for ANY app" guarantee above holds only for well-behaved apps.
+//
 //  Offsets are hard-coded to match partitions.csv (the bootloader is built
 //  for this exact layout).
 // =====================================================================
