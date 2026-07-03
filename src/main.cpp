@@ -37,6 +37,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "fwutil.h"      // pure helpers: lipoPct, prettyName, extractVersion, safeName, fwIdFromPath
+#include "mbedtls/sha256.h"  // firmware integrity: SHA-256 of downloaded/launched images
 
 // ---- M5Cardputer microSD pins (from the hardware spec) --------------
 static const int SD_SCK  = 40;   // G40 CLK
@@ -628,7 +629,53 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     return true;
 }
 
+// Lowercase-hex encode a byte buffer.
+static String toHex(const uint8_t* p, size_t n) {
+    static const char* H = "0123456789abcdef";
+    String s; s.reserve(n * 2);
+    for (size_t i = 0; i < n; i++) { s += H[p[i] >> 4]; s += H[p[i] & 0xF]; }
+    return s;
+}
+
+// SHA-256 an SD file into `outHex` (lowercase). Uses the ESP32 hardware SHA via
+// mbedTLS and shows a "Verifying" progress bar. Returns false if the file won't open.
+static bool sha256File(const String& path, String& outHex) {
+    File f = SD.open(path);
+    if (!f) return false;
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);                       // 0 = SHA-256 (not SHA-224)
+    static uint8_t hbuf[2048];
+    size_t total = f.size(), done = 0;
+    for (;;) {
+        int g = f.read(hbuf, sizeof(hbuf));
+        if (g <= 0) break;
+        mbedtls_sha256_update(&ctx, hbuf, g);
+        done += g;
+        if ((done & 0x3ffff) == 0 || done >= total) drawProgressBar("Verifying", done, total ? total : 0);
+    }
+    f.close();
+    uint8_t dig[32];
+    mbedtls_sha256_finish(&ctx, dig);
+    mbedtls_sha256_free(&ctx);
+    outHex = toHex(dig, 32);
+    return true;
+}
+
 static void flashFromSD(const String& path) {
+    // If a hash sidecar was saved at install time, verify the file is unchanged on the
+    // card before flashing it (catches SD-level corruption or tampering post-download).
+    String shaPath = path + ".sha256";
+    if (SD.exists(shaPath)) {
+        File sf = SD.open(shaPath); String want;
+        if (sf) { want = sf.readStringUntil('\n'); sf.close(); want.trim(); want.toLowerCase(); }
+        String have;
+        if (want.length() && sha256File(path, have) && have != want) {
+            std::vector<String> conf = { "Integrity check FAILED", "file changed since install", "YES - launch anyway", "NO - abort" };
+            int c = listMenu("Hash mismatch", conf, "ENTER=choose  `=abort", 3);
+            if (c != 2) return;                            // default: abort
+        }
+    }
     String fwId = fwIdFromPath(path);
     File f = SD.open(path);
     if (!f) { screenMsg("Open failed", path.c_str(), COL_ERR, 2000); return; }
@@ -841,7 +888,7 @@ static bool downloadURLToFile(const String& url, const String& dst, const char* 
 // Download a firmware URL to SD and keep the file AS-IS (full image or app).
 // The partition manager (buildAndLaunch) handles either form at launch time —
 // full images keep their bundled data partitions (e.g. Marauder's SPIFFS).
-static void installFromURL(const String& url, const String& name, const char* ua) {
+static void installFromURL(const String& url, const String& name, const char* ua, const String& expectedSha = "") {
     if (!sdOK && !mountSD()) { screenMsg("No SD card", nullptr, COL_ERR, 2000); return; }
     if (!connectWiFi()) return;
     screenMsg("Downloading...", name.c_str());
@@ -849,9 +896,25 @@ static void installFromURL(const String& url, const String& name, const char* ua
     String path = String(FW_DIR) + "/" + safeName(name) + ".bin";
     String tmp  = String(FW_DIR) + "/.dl.tmp";
     if (!downloadURLToFile(url, tmp, ua)) return;
+
+    // Integrity: hash the downloaded bytes. NB this hashes what we RECEIVED, so on a
+    // cert-less transport it does not by itself prove authenticity (see README) — it
+    // lets you verify against an out-of-band digest, enforces an expected hash when you
+    // have one, and pins the file so the launcher can detect later SD corruption.
+    String sha;
+    if (!sha256File(tmp, sha)) { SD.remove(tmp); screenMsg("Hashing failed", nullptr, COL_ERR, 3000); return; }
+    if (expectedSha.length()) {
+        String want = expectedSha; want.trim(); want.toLowerCase();
+        if (want != sha) { SD.remove(tmp); screenMsg("Hash mismatch!", ("got " + sha.substring(0, 16)).c_str(), COL_ERR, 5000); return; }
+    }
+
     SD.remove(path);
-    if (SD.rename(tmp, path)) screenMsg("Saved to SD!", (safeName(name) + ".bin").c_str(), COL_OK, 2200);
-    else { SD.remove(tmp); screenMsg("Install failed", nullptr, COL_ERR, 3000); }
+    if (!SD.rename(tmp, path)) { SD.remove(tmp); screenMsg("Install failed", nullptr, COL_ERR, 3000); return; }
+    // Persist the digest next to the image so flashFromSD can verify it's unchanged.
+    SD.remove(path + ".sha256");
+    File sf = SD.open(path + ".sha256", FILE_WRITE);
+    if (sf) { sf.print(sha); sf.close(); }
+    screenMsg(expectedSha.length() ? "Saved + verified" : "Saved to SD!", sha.substring(0, 16).c_str(), COL_OK, 2500);
 }
 
 // M5Burner download (full-flash image kept whole; partition-managed at launch).
@@ -910,7 +973,9 @@ static void githubInstall() {
     if (urls.empty()) { screenMsg("No .bin assets", "in latest release", COL_ERR, 3000); return; }
     int sel = listMenu("GitHub assets", labels, "ENTER=install  `=back");
     if (sel < 0 || sel >= (int)urls.size()) return;
-    installFromURL(urls[sel], labels[sel].substring(0, labels[sel].lastIndexOf('.')), "M5CardputerLoader");
+    String want;                                          // optional out-of-band SHA-256 to enforce
+    textInput("Expected SHA-256 (blank=skip)", want);
+    installFromURL(urls[sel], labels[sel].substring(0, labels[sel].lastIndexOf('.')), "M5CardputerLoader", want);
 }
 
 // OTA menu: show the cached M5Burner Cardputer catalog from SD, refresh,
@@ -1216,14 +1281,14 @@ static void firmwareAction(const String& name, const String& path) {
         int dot = nn.lastIndexOf('.'); if (dot > 0) nn = nn.substring(0, dot); // strip .bin
         if (textInput("New name", nn) && nn.length()) {
             String np = String(FW_DIR) + "/" + safeName(nn) + ".bin";
-            if (SD.rename(path, np)) screenMsg("Renamed", nullptr, COL_OK, 1200);
+            if (SD.rename(path, np)) { SD.rename(path + ".sha256", np + ".sha256"); screenMsg("Renamed", nullptr, COL_OK, 1200); }
             else screenMsg("Rename failed", nullptr, COL_ERR, 2000);
         }
     }
     else if (a == 3) {                                       // delete
         std::vector<String> conf = { String("Delete ") + name + "?", "YES - delete", "NO - keep" };
         int c = listMenu("Confirm", conf, "ENTER=choose  `=cancel", 1);
-        if (c == 1) { SD.remove(path); screenMsg("Deleted", nullptr, COL_OK, 1000); }
+        if (c == 1) { SD.remove(path); SD.remove(path + ".sha256"); screenMsg("Deleted", nullptr, COL_OK, 1000); }
     }
 }
 

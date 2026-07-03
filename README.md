@@ -155,6 +155,24 @@ manages it: `/firmware/_m5cat.tsv` (cached M5Burner index) and
 
 ---
 
+## Firmware integrity
+
+Every OTA/GitHub download is SHA‑256 hashed; the digest is shown on the *Saved*
+screen and written beside the image as `<name>.bin.sha256`. Before launching a
+firmware that has such a sidecar, the loader re‑hashes the file and warns/aborts
+if it changed on the card — catching SD corruption or tampering after download.
+
+When installing from a **GitHub release** you can paste an **expected SHA‑256**
+(blank to skip); the install is rejected on mismatch.
+
+> The hash is computed over the bytes actually received, so on its own it does
+> **not** prove authenticity over the project's cert‑less TLS (downloaded images
+> are otherwise unverified). Its value is (a) verifying against a digest you got
+> out‑of‑band and (b) pinning the file against later change. Real transport
+> authenticity still needs cert pinning or image signing.
+
+---
+
 ## Known limitation
 
 Firmwares that need their **own large data partition** at a fixed offset (e.g.
