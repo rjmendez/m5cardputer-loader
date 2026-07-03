@@ -1,0 +1,20 @@
+name: test
+
+# Host-compiled unit tests for the pure helpers in src/fwutil.h (no hardware needed).
+# Fast — seconds — so logic regressions are caught alongside the firmware build.
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fwutil:
+    name: Host unit tests (fwutil)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & run host tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -o /tmp/test_fwutil test/test_fwutil.cpp
+          /tmp/test_fwutil
