@@ -689,6 +689,19 @@ static void flashFromSD(const String& path) {
     if (!ok) screenMsg("Launch failed", "incompatible image?", COL_ERR, 3000);
 }
 
+// The Mozilla root-CA bundle embedded by arduino-esp32 (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE).
+extern const uint8_t rootca_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t rootca_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
+
+// Configure a WiFiClientSecure to actually VALIDATE the server certificate against the
+// bundled root CAs, replacing setInsecure(). Covers the m5stack + GitHub hosts (and their
+// CDNs) and survives cert rotation without pinning individual certs. NB: chain validation
+// costs extra heap during the TLS handshake — callers already free large buffers first and
+// run at 240 MHz (connectWiFi) to keep the handshake from OOMing.
+static void secureClient(WiFiClientSecure& c) {
+    c.setCACertBundle(rootca_crt_bundle_start, (size_t)(rootca_crt_bundle_end - rootca_crt_bundle_start));
+}
+
 // =====================================================================
 //  WiFi
 // =====================================================================
@@ -728,7 +741,7 @@ static bool fetchCatalog() {
     if (!connectWiFi()) return false;
 
     screenMsg("Fetching catalog...", "from M5Burner");
-    WiFiClientSecure client; client.setInsecure();
+    WiFiClientSecure client; secureClient(client);
     HTTPClient http;
     if (!http.begin(client, M5B_LIST)) { screenMsg("HTTP begin failed", nullptr, COL_ERR, 2500); return false; }
     http.setUserAgent("M5Burner");
@@ -847,7 +860,7 @@ static bool fetchCatalog() {
 
 // Download any URL to an SD file, following redirects, with a progress bar.
 static bool downloadURLToFile(const String& url, const String& dst, const char* ua) {
-    WiFiClientSecure client; client.setInsecure();
+    WiFiClientSecure client; secureClient(client);
     HTTPClient http;
     http.setUserAgent(ua);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub assets redirect to a CDN
@@ -934,7 +947,7 @@ static void githubInstall() {
 
     String api = "https://api.github.com/repos/" + repo + "/releases/latest";
     screenMsg("Fetching release...", repo.c_str());
-    WiFiClientSecure client; client.setInsecure();
+    WiFiClientSecure client; secureClient(client);
     HTTPClient http;
     http.setUserAgent("M5CardputerLoader");
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
