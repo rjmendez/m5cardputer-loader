@@ -417,11 +417,17 @@ static const esp_partition_t* dataPart(const char* label) {
     return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label);
 }
 
-// Is the partition effectively empty (first 4KB all 0xFF)? Skip backing those up.
+// Is the partition effectively empty? Scans the first 4KB (a cheap heuristic —
+// NVS/SPIFFS write near the front) rather than a single 256B page, which was
+// small enough to miss data and skip a needed snapshot. Skip backing empties up.
 static bool partitionLooksEmpty(const esp_partition_t* p) {
     uint8_t buf[256];
-    if (esp_partition_read(p, 0, buf, sizeof(buf)) != ESP_OK) return true;
-    for (uint8_t b : buf) if (b != 0xFF) return false;
+    uint32_t scan = p->size < 0x1000 ? p->size : 0x1000;   // first 4KB
+    for (uint32_t off = 0; off < scan; off += sizeof(buf)) {
+        uint32_t n = scan - off; if (n > sizeof(buf)) n = sizeof(buf);
+        if (esp_partition_read(p, off, buf, n) != ESP_OK) return true;
+        for (uint32_t i = 0; i < n; i++) if (buf[i] != 0xFF) return false;
+    }
     return true;
 }
 
@@ -429,15 +435,21 @@ static bool backupPartition(const char* label, const String& path) {
     const esp_partition_t* p = dataPart(label);
     if (!p) return false;
     if (partitionLooksEmpty(p)) { SD.remove(path); return true; }   // nothing to save
-    File f = SD.open(path, FILE_WRITE);
+    // Write to a temp file and rename over the target so an interrupted/failed
+    // backup leaves the previous good snapshot intact (was: truncate-in-place).
+    String tmp = path + ".tmp";
+    SD.remove(tmp);
+    File f = SD.open(tmp, FILE_WRITE);
     if (!f) return false;
     static uint8_t buf[4096];
     for (uint32_t off = 0; off < p->size; off += sizeof(buf)) {
         uint32_t n = p->size - off; if (n > sizeof(buf)) n = sizeof(buf);
-        if (esp_partition_read(p, off, buf, n) != ESP_OK) { f.close(); SD.remove(path); return false; }
+        if (esp_partition_read(p, off, buf, n) != ESP_OK) { f.close(); SD.remove(tmp); return false; }
         f.write(buf, n);
     }
     f.close();
+    SD.remove(path);
+    if (!SD.rename(tmp, path)) { SD.remove(tmp); return false; }
     return true;
 }
 

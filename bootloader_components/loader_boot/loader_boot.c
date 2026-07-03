@@ -41,6 +41,19 @@ void bootloader_hooks_include(void) {}
 #define OTADATA_SIZE    0x00002000u
 #define BOOT_MAGIC      0xB007A001u
 
+// True if [off, off+len) reads back as all-0xFF (erased). On any read error we
+// return 0 (not-blank) so the caller performs the erase — the safe default.
+static int region_is_blank(uint32_t off, uint32_t len)
+{
+    uint8_t b[256];
+    for (uint32_t p = 0; p < len; p += sizeof(b)) {
+        uint32_t n = len - p; if (n > sizeof(b)) n = sizeof(b);
+        if (bootloader_flash_read(off + p, b, n, false) != 0) return 0;
+        for (uint32_t i = 0; i < n; i++) if (b[i] != 0xFF) return 0;
+    }
+    return 1;
+}
+
 void bootloader_after_init(void)
 {
     uint32_t magic = 0;
@@ -53,6 +66,15 @@ void bootloader_after_init(void)
         bootloader_flash_erase_range(BOOTFLAG_OFFSET, BOOTFLAG_SIZE);
     } else {
         // No request -> force the loader: wipe otadata -> boot factory.
-        bootloader_flash_erase_range(OTADATA_OFFSET, OTADATA_SIZE);
+        // Skip the erase when otadata is already blank: this hook runs on EVERY
+        // boot, and erasing 2 sectors each time is needless flash wear plus a
+        // power-loss window. When it isn't blank, the erase is essential (else the
+        // just-run app boots again and can mark itself valid), so check the result
+        // and retry once on failure.
+        if (!region_is_blank(OTADATA_OFFSET, OTADATA_SIZE)) {
+            if (bootloader_flash_erase_range(OTADATA_OFFSET, OTADATA_SIZE) != 0) {
+                bootloader_flash_erase_range(OTADATA_OFFSET, OTADATA_SIZE);
+            }
+        }
     }
 }

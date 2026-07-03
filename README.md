@@ -175,6 +175,25 @@ fine. A future "partition‑manager" mode could rewrite the table per‑firmware
 
 ---
 
+## Security
+
+This is a hobbyist tool; treat its network paths as **trusted‑LAN only**:
+
+- **Downloaded firmware is not verified.** M5Burner/GitHub downloads use TLS
+  without certificate validation (`setInsecure`) and follow redirects, and no
+  hash/signature is checked before an image becomes launchable — so on a hostile
+  network an on‑path attacker can substitute the image. Only install firmware on
+  a network you trust.
+- **The WebUI has no authentication.** While *WebUI Upload* is running, anyone on
+  the same WiFi can upload/replace/delete `/firmware/*.bin`. Start it only on a
+  trusted network and exit it when you're done.
+- **WiFi credentials are stored unencrypted** in the loader's NVS (flash
+  encryption is not enabled), and the optional creds image is a plaintext build
+  artifact — don't leave it on shared machines (`flash-all.sh full` now shreds it
+  after flashing unless `KEEP_WIFI=1`).
+
+Hardening is tracked in the issue tracker.
+
 ## Project layout
 
 ```
