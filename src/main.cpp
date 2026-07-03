@@ -506,7 +506,13 @@ static bool writeImagePartition(File& f, uint32_t src, uint32_t len, const char*
     static uint8_t buf[4096]; uint32_t done = 0;
     while (done < len) {
         uint32_t want = len - done; if (want > sizeof(buf)) want = sizeof(buf);
-        int g = f.read(buf, want); if (g <= 0) return false;
+        // Coalesce short reads so `g` equals `want` except at end-of-data. `want` is a
+        // multiple of 4 for every chunk but the last, so the esp_partition_write offset
+        // (`done`) stays 4-byte aligned. Advancing `done` by the padded length instead
+        // would shift the remaining data; padding is only ever the final tail.
+        int g = 0;
+        while (g < (int)want) { int r = f.read(buf + g, want - g); if (r <= 0) break; g += r; }
+        if (g <= 0) return false;
         int wl = g; while (wl & 3) buf[wl++] = 0xFF;
         if (esp_partition_write(p, done, buf, wl) != ESP_OK) return false;
         done += g;
