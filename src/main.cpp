@@ -579,7 +579,18 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     if (done != appLen || !Update.end(true)) { screenMsg("Finalize failed", Update.errorString(), COL_ERR, 3500); return false; }
 
     // 2) write bundled data partitions (e.g. Marauder's SPIFFS) into matching labels
-    for (int i = 0; i < nd; i++) writeImagePartition(f, data[i].off, data[i].sz, data[i].lbl, "Installing data");
+    bool wroteSpiffs = false;
+    for (int i = 0; i < nd; i++) {
+        writeImagePartition(f, data[i].off, data[i].sz, data[i].lbl, "Installing data");
+        if (!strcmp(data[i].lbl, "spiffs")) wroteSpiffs = true;
+    }
+    // A full image that bundles no matching spiffs would otherwise inherit the PREVIOUS
+    // firmware's filesystem, since the loader's spiffs is never touched in the full path
+    // (the restore below is app-only). Wipe it so nothing leaks across firmwares.
+    if (full && !wroteSpiffs) {
+        const esp_partition_t* sp = dataPart("spiffs");
+        if (sp) esp_partition_erase_range(sp, 0, sp->size);
+    }
 
     // 3) per-firmware persistence: restore saved NVS (settings). For app-only also
     //    restore its SPIFFS snapshot; full images take SPIFFS from the image itself.
