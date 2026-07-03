@@ -560,7 +560,15 @@ static bool buildAndLaunch(File& f, const String& fwId, bool full) {
     uint8_t hdr[24]; f.seek(appOff);
     if (f.read(hdr, 24) != 24 || hdr[0] != 0xE9) { screenMsg("Bad app image", nullptr, COL_ERR, 3000); return false; }
     int segs = hdr[1]; bool hashapp = (hdr[23] == 1); appLen = 24;
-    for (int s = 0; s < segs; s++) { uint8_t sh[8]; f.seek(appOff + appLen); if (f.read(sh, 8) != 8) { screenMsg("Bad app (segs)", nullptr, COL_ERR, 3000); return false; } appLen += 8 + rd32f(sh + 4); }
+    for (int s = 0; s < segs; s++) {
+        uint8_t sh[8]; f.seek(appOff + appLen);
+        if (f.read(sh, 8) != 8) { screenMsg("Bad app (segs)", nullptr, COL_ERR, 3000); return false; }
+        uint32_t seglen = rd32f(sh + 4);
+        // Reject implausible/overflowing segment lengths from an untrusted .bin before they
+        // wrap appLen (which would defeat the "too big for ota_0" check below). 0x800000 = 8MB flash.
+        if (seglen > 0x800000u || appLen > 0x800000u - 8 - seglen) { screenMsg("Bad app (seg size)", nullptr, COL_ERR, 3000); return false; }
+        appLen += 8 + seglen;
+    }
     appLen += 1; if (appLen % 16) appLen += 16 - (appLen % 16); if (hashapp) appLen += 32;
 
     // 1) write the app into ota_0 via the Update API
@@ -734,7 +742,12 @@ static bool fetchCatalog() {
                     if (depth == 0) {              // end of a top-level entry
                         scanned++;
                         if (isCard && curName.length() && curFile.endsWith(".bin")) {
-                            curName.replace('\t', ' '); curName.replace('\n', ' ');
+                            // Strip TAB/CR/LF from every field, not just name — the TSV cache is
+                            // split on tabs/newlines, so a stray control byte in ver/file would
+                            // misalign columns (wrong download file) or drop the row.
+                            for (String* fld : { &curName, &curVer, &curFile }) {
+                                fld->replace('\t', ' '); fld->replace('\r', ' '); fld->replace('\n', ' ');
+                            }
                             out.printf("%s\t%s\t%s\n", curName.c_str(), curVer.c_str(), curFile.c_str());
                             found++;
                         }
@@ -840,7 +853,7 @@ static void githubInstall() {
         if (c < 0) { if (!http.connected()) break; delay(2); continue; }
         char ch = (char)c;
         if (instr) {
-            if (esc) { token += ch; esc = false; }
+            if (esc) { if (token.length() < 256) token += ch; esc = false; }  // bound growth on the escape path too
             else if (ch == '\\') esc = true;
             else if (ch == '"') {
                 instr = false;
