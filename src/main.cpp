@@ -148,6 +148,10 @@ static Nav pollNav() {
     if (changed) {
         lastActivity = millis();
         if (dimState) { setCpuFrequencyMhz(80); dsp.setBrightness(g_bright); dimState = 0; return N_NONE; }  // wake screen + clock
+        // Drop back to the idle clock if a WiFi/TLS op left us at 240MHz and we're now just
+        // browsing menus (submenu loops like otaMenu never re-enter loop()'s restore). pollNav
+        // isn't called during a blocking transfer, so this can't throttle a live download.
+        if (getCpuFrequencyMhz() > 80) setCpuFrequencyMhz(80);
     } else {
         uint32_t idle = millis() - lastActivity;        // two-stage idle blanking (launcher only)
         if (g_offMs && idle > g_offMs) {                // screen off + deep-idle 40MHz (lowest draw -> charges fastest)
@@ -608,8 +612,10 @@ static void flashFromSD(const String& path) {
 //  WiFi
 // =====================================================================
 static bool connectWiFi() {
+    setCpuFrequencyMhz(240);   // full speed for WiFi/TLS; loop()/pollNav drop back to 80 when idle.
+                               // Must run even when already associated, else a second network op
+                               // (WiFi still up, loop() forced 80) runs the whole transfer at 80MHz.
     if (WiFi.status() == WL_CONNECTED) return true;
-    setCpuFrequencyMhz(240);   // full speed for WiFi/TLS; loop() drops back to 80 when idle
     String ssid = prefs.getString("ssid", "");
     String pass = prefs.getString("pass", "");
     if (ssid.isEmpty()) { screenMsg("No WiFi set", "Settings > WiFi Setup", COL_ERR, 2500); return false; }
